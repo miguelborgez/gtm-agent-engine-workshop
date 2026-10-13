@@ -34,6 +34,11 @@ from . import data_service
 from .data_service import REP_IDS
 
 MODEL_NAME = "gpt-4o-mini"
+SCORING_WEIGHTS = {
+    "revenue_fit": 0.3,
+    "tech_stack_match": 0.4,
+    "segment_fit": 0.3,
+}
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -68,13 +73,17 @@ def build_prospect_profile(prospect_id: str) -> dict:
 
 
 SCORING_PROMPT = (
-    "You are a GTM assistant. Score the prospect's potential for the offering from "
-    "1 to 100 based on how good a fit they are, weighing their annual revenue and "
-    "tech stack. In your justification, explicitly list which of the offering's required "
-    "technologies the prospect has and which required technologies they are missing, naming "
-    "each one. Any missing required technology must lower the tech_stack_match component and "
-    "the overall score. Return a score and a justification that reflects your "
-    "overall assessment of this prospect's potential."
+    "You are a GTM assistant. Assess the prospect's segment fit from 1 to 100 and "
+    "write a justification for the offering fit. The overall score is calculated as "
+    f"{SCORING_WEIGHTS['revenue_fit']:.0%} revenue fit, "
+    f"{SCORING_WEIGHTS['tech_stack_match']:.0%} tech-stack match, and "
+    f"{SCORING_WEIGHTS['segment_fit']:.0%} segment fit. Revenue fit is 100 when "
+    "annual revenue meets or exceeds the minimum and 0 when it is below the minimum. "
+    "Tech-stack match is the percentage of required technologies present in the "
+    "prospect's tech stack, or 100 when no technologies are required. In your "
+    "justification, explicitly list which required technologies the prospect has "
+    "and which they are missing, naming each one, and explain the weighted policy "
+    "without inventing a different overall score."
 )
 
 from typing import Literal
@@ -98,8 +107,15 @@ _scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_outpu
 
 def _offering_has_required_fields(offering):
     "Return True if the offering has the fields needed to score against it."
-    return bool(offering) and bool(offering.get("required_tech_stack")) and \
+    return bool(offering) and isinstance(offering.get("required_tech_stack"), list) and \
         offering.get("min_annual_revenue") is not None and bool(offering.get("description"))
+
+
+def _tech_stack_match(prospect_tech_stack, required_tech_stack):
+    if not required_tech_stack:
+        return 100.0
+    present_count = sum(technology in prospect_tech_stack for technology in required_tech_stack)
+    return present_count / len(required_tech_stack) * 100
 
 
 @tool
@@ -119,6 +135,16 @@ def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict
         {"role": "system", "content": SCORING_PROMPT},
         {"role": "user", "content": user},
     ])
+    annual_revenue = float(prospect_profile.get("annual_revenue") or 0)
+    minimum_revenue = float(offering["min_annual_revenue"])
+    result.rubric_breakdown.revenue_fit = 100.0 if annual_revenue >= minimum_revenue else 0.0
+    result.rubric_breakdown.tech_stack_match = _tech_stack_match(
+        prospect_profile.get("tech_stack") or [], offering["required_tech_stack"]
+    )
+    result.score = round(sum(
+        getattr(result.rubric_breakdown, component) * weight
+        for component, weight in SCORING_WEIGHTS.items()
+    ), 1)
     return result.model_dump()
 
 
